@@ -88,7 +88,7 @@ frecuencias_df <- datos_char %>%
 print(frecuencias_df)
 
 
-# Aplicar el método missForest a tu dataset
+# Aplicar el método missForest al dataset
 imputacion <- missForest(datos_numericos, ntree = 200, maxiter = 5)
 datos_imputados <- imputacion$ximp
 # Ver el dataset imputado
