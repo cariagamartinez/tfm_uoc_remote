@@ -1,30 +1,1222 @@
 ---
-title: "Long COVID and Neuropsychological Factors: Design and Validation of a Screening Tool Using Artificial Intelligence. Role and Importance of Neuropsychological Variables."
-author: "Ariel Ernesto Cariaga Martínez"
-date: "2024-12-06"
+title: "TFM_UOC"
+author: "Ariel Cariaga Martínez"
+date: "`r Sys.Date()`"
 output: pdf_document
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE,
+  eval = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  error = FALSE,
+  fig.align = "center",
+  cache = TRUE,
+  tidy = TRUE,
+  comment = ''
+)
 ```
 
-## R Markdown
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+```{r}
+# Librerías
+library(knitr)
+library(kableExtra)
+library(fastDummies)
+library(xgboost)
+library(tidyverse)
+library(naniar)
+library(corrplot)
+library(caret)
+library(DMwR2) #imputación knn
+library(reshape2)
+library(FactoMineR)
+library(factoextra)
+library(ggrepel)
+library(MASS) # LDA
+library(car)
+library(multcomp)
+library(pROC)
+library(fastshap)
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+#Otras posibles
+#library(readxl)
+#library(psych)
+#library(DataExplorer)
+#library(GGally)
+#library(ROSE)
+#library(ggfortify)
 
-```{r cars}
-summary(cars)
 ```
 
-## Including Plots
+```{r, echo=FALSE, results='hide', comment=''}
+# ----------------------
+# Acceso a la base de datos principal
+# ----------------------
 
-You can also embed plots, for example:
+#LA BASE DE DATOS DEBE UBICARSE Y LLAMARSE TAL COMO LA LECTURA PARA QUE EL RESTO DEL RMARKDOWN FUNCIONE
+#POR MOTIVOS DE SEGURIDAD, NO ESTÁ COMPARTIDA: data/bbddAECM_07_10_24.csv
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+bbddAECM <- read_csv("data/bbddAECM_07_10_24.csv")
+```
+## OBTENCIÓN DEL DATASET FINAL
+
+Tras reunión de coordinación, seleccionaremos demográficas y clínicas relevantes.
+
+La columna del espectro clínico de la primera infección tiene NAs, con una proporción de 10 asintomáticos, 35 hospitalizados, 185 en mild-moderated y 7 en UCI. La imputación que generaré es con el valor más común.
+
+```{r}
+#Seleccionamos el espectro clínico de la primera infección
+column_spec <- bbddAECM$spec1
+selected_spec <- data.frame(spec1 = column_spec)
+
+#Imputación de valores faltantes en la columna 'spec1'
+most_frequent <- names(sort(table(selected_spec), decreasing = TRUE))[1]
+
+#Imputamos los valores faltantes con el más frecuente
+selected_spec[is.na(selected_spec)] <- most_frequent
+
+#Generamos dummies solo para 'spec1'
+selected_spec1_dummy <- dummy_cols(selected_spec, 
+                                   remove_first_dummy = TRUE, 
+                                   remove_selected_columns = TRUE)
+
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+Ahora seleccionamos las demográficas de interés.
+
+```{r}
+#Variables sociodemográficas indicadas en la reunión de coordinación.
+selected_sociodemographic <- bbddAECM %>%
+  dplyr::select(sex, ag, el, ptg19)
+
+#Creamos dummies para las variables demográficas seleccionadas.
+selected_sociodemographic_dummies <- dummy_cols(
+  selected_sociodemographic,
+  remove_first_dummy = TRUE,
+  remove_selected_columns = TRUE
+)
+
+```
+
+Ahora seleccionamos las variables neuropsicológicas de interés.
+
+```{r}
+#Realizmos selección de tests neuropsicológicos de interés.
+selected_neuropsychological <- bbddAECM %>%
+  dplyr::select(tn46, tn52, tn36, 
+                tn38, tn40, tn42, 
+                tn22, tn44, tn14,
+                tn24, tn12, tn6, 
+                tn30, tn34, tn8, 
+                tn48, tn50)
+```
+
+Y ahora que ya tenemos todas la variables de interés las combinamos en un único dataset.
+
+```{r}
+#Combinamos las variables seleccionadas en un solo dataset.
+df_def <- bind_cols(selected_sociodemographic_dummies, selected_spec1_dummy, selected_neuropsychological)
+```
+
+Resta crear la variable Target sobre la que generaremos el estudio.
+
+```{r}
+#Seleccionamos NoCOVID y No LongCOVID (que será un grupo) vs LongCovid Cog
+column_cluster <- bbddAECM$cluster
+selected_cluster <- data.frame(cluster = column_cluster)
+
+#Creamos la nueva variable Target
+selected_cluster$cluster <- ifelse(
+  selected_cluster$cluster %in% c("No COVID", "No LongCOVID"), "No_LC",
+  ifelse(selected_cluster$cluster == "LongCOVID Cog", "LC_Cog", NA)  # Excluir "LongCOVID NoCog"
+)
+
+#Convertimos Target a factor
+selected_cluster$cluster <- factor(selected_cluster$cluster, levels = c("No_LC", "LC_Cog"))
+
+#Convertimos a numérico restando 1 para que los niveles sean 0 y 1
+selected_cluster$cluster_binary <- as.numeric(selected_cluster$cluster) - 1
+
+```
+
+Finalmente unimos todas las variables definitivamente seleccionadas.
+
+```{r}
+#Unimos la columna de los targets al dataframe final
+df_def <- cbind(df_def, Target = selected_cluster$cluster_binary)
+
+#-------------------------------------------------------------------------------
+##COMPROBAMOS QUE LOS INDICES COINCIDEN EN LA BBDD ORIGINAL Y EN LA RE-CREADA
+#-------------------------------------------------------------------------------
+
+#Obtenemos los índices de las observaciones donde cluster es "LongCOVID NoCog"
+indices <- which(bbddAECM$cluster == "LongCOVID NoCog")
+
+#Verificamos
+print(indices)
+
+#Obtenemos los índices de las observaciones donde Target es NA en el nuevo dataset
+indices_na <- which(is.na(df_def$Target))
+
+#Verificamos
+print(indices_na)
+
+#ELIMINAMOS TODAS LAS OBSERVACIONES NAS EN TARGET
+df_def <- df_def[!is.na(df_def$Target), ]
+
+#Dado que los índices coinciden, df_def será el dataset que utilizaremos para realizar el TFM
+
+#Aquí remodificamos los nombres para evitar problemas
+df_def <- df_def %>% rename_with(make.names)
+
+```
+
+
+```{r}
+# ----------------------
+# Análisis general del dataset de trabajo final generado
+# ----------------------
+
+#Vemos tipos de variables y estructura
+str(df_def)
+
+#Resumen estadístico
+summary(df_def)
+
+# if (!requireNamespace("webshot", quietly = TRUE)) {
+#   install.packages("webshot")
+#   webshot::install_phantomjs()
+# }
+# library(webshot)
+# 
+# # Crear un data frame a partir del summary
+# summary_table <- as.data.frame(summary(df_def))
+# 
+# save_kable(
+#   kable(summary_table, format = "html", caption = "Resumen de df_def") %>%
+#     kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover", "condensed")),
+#   file = "tabla_resumen.html"
+# )
+# 
+# # Convertir el archivo HTML a JPG
+# webshot("tabla_resumen.html", file = "tabla_resumen.jpg", vwidth = 800, vheight = 600)
+
+#Ver las dimensiones y primeras filas
+cat("Dimensiones del dataset:", dim(df_def), "\n")
+
+```
+
+Vamos a verificar si hay algún valor faltante
+
+```{r}
+# ----------------------
+# Valores faltantes
+# ----------------------
+
+#Resumen de valores faltantes
+gg_miss_var(df_def, show_pct = TRUE)
+
+```
+```{r}
+#-------------------------------------------------------------------------------
+# IMAGEN 1
+#-------------------------------------------------------------------------------
+pdf("outputs/images/01_NAs.pdf", width = 16, height = 10)
+gg_miss_var(df_def, show_pct = TRUE)
+dev.off()
+```
+
+
+Como no tenemos una idea global del tipo de valores faltantes, vamos a hacer una imputación con kNN para estos.
+
+```{r}
+# ----------------------
+# Imputación de valores faltantes
+# ----------------------
+
+#Excluimos columnas específicas
+excluded_cols <- c("Target")
+
+#Separamos las columnas excluidas
+excluded_data <- df_def %>% 
+  dplyr::select(all_of(excluded_cols))
+
+#Convertimos todas las columnas numéricas a tipo double
+data_for_imputation_selected <- df_def %>% dplyr::select(-all_of(excluded_cols))
+data_for_imputation_selected <- data_for_imputation_selected %>%
+  mutate(across(where(is.numeric), as.numeric))
+
+#Aplicamos la imputación
+selected_data_imputed <- knnImputation(data_for_imputation_selected, k = 10)
+
+#Combinamos las columnas imputadas con las excluidas
+df_def_clean <- bind_cols(selected_data_imputed, excluded_data)
+
+#Gráfico tras imputación
+gg_miss_var(df_def_clean, show_pct = TRUE)
+
+```
+
+```{r}
+#-------------------------------------------------------------------------------
+# IMAGEN 2
+#-------------------------------------------------------------------------------
+pdf("outputs/images/02_NAs_tras_imputacion.pdf", width = 16, height = 10)
+gg_miss_var(df_def_clean, show_pct = TRUE)
+dev.off()
+```
+
+Vamos a dejar el código del balanceo del dataset y guardamos el dataset balanceado por si fuera de interés para utilizarlo posteriormente.
+
+```{r}
+# ----------------------
+# Balancear el dataset (no se utiliza el dataset balanceado pero se deja para constancia futura)
+# ----------------------
+
+table(df_def_clean$Target) #Hay 64 vs 174
+
+#Si aplicmos ROSE: OJO: DATOS SINTÉTICOS
+#df_def_clean_balanced_ROSE <- ROSE(Target ~ ., data = df_combined_clean, seed = 123, method = "under")$data
+
+#Oversampling manual
+minority_class <- df_def_clean %>% filter(Target == "0")
+oversampled <- minority_class %>% sample_n(size = nrow(df_def_clean[df_def_clean$Target == "1", ]), replace = TRUE)
+
+#Combinamos con la clase mayoritaria
+df_def_clean_balanced <- bind_rows(
+  df_def_clean %>% filter(Target == "1"),
+  oversampled
+)
+
+table(df_def_clean_balanced$Target)
+
+```
+Análisis univariado de variables numéricas
+
+```{r}
+# ----------------------
+# Análisis univariado
+# ----------------------
+
+# a) Seleccionar variables numéricas
+numeric_vars_def <- df_def_clean %>% dplyr::select(where(is.numeric))
+
+# Histogramas para variables numéricas
+numeric_vars_def %>%
+  gather(key = "Variable", value = "Value") %>%
+  ggplot(aes(x = Value)) +
+  geom_histogram(bins = 30, fill = "skyblue", color = "black") +
+  facet_wrap(~ Variable, scales = "free") +
+  theme_minimal() +
+  labs(title = "Distribuciones de variables numéricas en conjunto de datos final")
+
+```
+
+```{r}
+#-------------------------------------------------------------------------------
+# IMAGEN 3
+#-------------------------------------------------------------------------------
+pdf("outputs/images/03_univariado_num.pdf", width = 16, height = 10)
+# Histogramas para variables numéricas
+numeric_vars_def %>%
+  gather(key = "Variable", value = "Value") %>%
+  ggplot(aes(x = Value)) +
+  geom_histogram(bins = 30, fill = "skyblue", color = "black") +
+  facet_wrap(~ Variable, scales = "free") +
+  theme_minimal() +
+  labs(title = "Distribuciones de variables numéricas en conjunto de datos final")
+dev.off()
+```
+
+
+Análisis univariado de variables categóricas
+
+```{r}
+# b) Variables categóricas
+# Seleccionar columnas específicas y transformarlas a factor: mantenemos el nombre cambiado
+# para evitar afectar el dataset generado con columnas numéricas que usaremos en los modelos
+df_def_clean_factors <- df_def_clean %>%
+  mutate(across(
+    where(~ is.numeric(.) && all(. %in% c(0, 1)) && n_distinct(.) == 2),
+    as.factor
+  ))
+
+# b.1) Selección de variables categóricas
+categorical_vars_def <- df_def_clean_factors %>% dplyr::select(where(is.factor))
+
+# Gráficos de barras para variables categóricas
+categorical_vars_def %>%
+  gather(key = "Variable", value = "Value") %>%
+  ggplot(aes(x = Value, fill = Variable)) +
+  geom_bar() +
+  facet_wrap(~ Variable, scales = "free") +
+  theme_minimal() +
+  labs(title = "Distribuciones de variables categóricas en el conjunto de datos final")
+```
+
+```{r}
+#-------------------------------------------------------------------------------
+# IMAGEN 4
+#-------------------------------------------------------------------------------
+pdf("outputs/images/04_categóricas.pdf", width = 16, height = 10)
+#Gráficos de barras para variables categóricas
+categorical_vars_def %>%
+  gather(key = "Variable", value = "Value") %>%
+  ggplot(aes(x = Value, fill = Variable)) +
+  geom_bar() +
+  facet_wrap(~ Variable, scales = "free") +
+  theme_minimal() +
+  labs(title = "Distribuciones de variables categóricas en el conjunto de datos final")
+dev.off()
+```
+
+Correlación y relaciones multivariadas
+
+```{r}
+# ----------------------
+# Correlación y relaciones multivariadas
+# ----------------------
+
+# a) Correlación entre variables numéricas
+cor_matrix_def <- cor(numeric_vars_def, use = "pairwise.complete.obs")
+corrplot(cor_matrix_def, method = "color", type = "full", tl.cex = 0.7, tl.srt = 45)
+
+#Filtramos correlaciones mayores o iguales a 0.6 (sin incluir la diagonal)
+threshold_def <- 0.6
+high_correlations_def <- which(abs(cor_matrix_def) >= threshold_def & abs(cor_matrix_def) < 1, arr.ind = TRUE)
+
+#Creamos un dataframe con las variables altamente correlacionadas: enviar a coordinación
+cor_df_def <- data.frame(
+  Var1 = rownames(cor_matrix_def)[high_correlations_def[, 1]],
+  Var2 = colnames(cor_matrix_def)[high_correlations_def[, 2]],
+  Correlation = cor_matrix_def[high_correlations_def]
+)
+
+#Eliminamos duplicados (porque la matriz de correlación es simétrica) y creamos csv
+cor_df_def <- cor_df_def[!duplicated(t(apply(cor_df_def, 1, sort))), ]
+write.csv(cor_df_def, "./outputs/correlaciones.csv")
+
+#Mostramos las correlaciones
+print(cor_df_def)
+
+```
+
+```{r}
+#-------------------------------------------------------------------------------
+# IMAGEN 5
+#-------------------------------------------------------------------------------
+
+pdf("outputs/images/05_correlacion.pdf", width = 16, height = 10)
+
+# a) Correlación entre variables numéricas
+cor_matrix_def <- cor(numeric_vars_def, use = "pairwise.complete.obs")
+corrplot(cor_matrix_def, method = "color", type = "full", tl.cex = 0.7, tl.srt = 45)
+
+#Filtramos correlaciones mayores o iguales a 0.6 (sin incluir la diagonal)
+threshold_def <- 0.6
+high_correlations_def <- which(abs(cor_matrix_def) >= threshold_def & abs(cor_matrix_def) < 1, arr.ind = TRUE)
+
+#Creamos un dataframe con las variables altamente correlacionadas: enviar a coordinación
+cor_df_def <- data.frame(
+  Var1 = rownames(cor_matrix_def)[high_correlations_def[, 1]],
+  Var2 = colnames(cor_matrix_def)[high_correlations_def[, 2]],
+  Correlation = cor_matrix_def[high_correlations_def]
+)
+
+#Eliminamos duplicados (porque la matriz de correlación es simétrica) y creamos csv
+cor_df_def <- cor_df_def[!duplicated(t(apply(cor_df_def, 1, sort))), ]
+#write.csv(cor_df_def, "./outputs/correlaciones.csv")
+
+#Mostramos las correlaciones
+print(cor_df_def)
+
+dev.off()
+```
+
+
+Relaciones numéricas-categóricas
+
+```{r}
+# ----------------------
+# b) Relaciones numéricas-categóricas
+# ----------------------
+
+#Ajustando "Target" como variable objetivo
+if ("Target" %in% colnames(df_def_clean)) {
+  df_def_clean %>%
+    mutate(Target = as.factor(Target)) %>% #Considerando que Target es binaria
+    gather(key = "Variable", value = "Value", -Target) %>%
+    filter(!is.na(Value)) %>%
+    ggplot(aes(x = Target, y = Value)) +
+    geom_boxplot() +
+    facet_wrap(~ Variable, scales = "free") +
+    theme_minimal() +
+    labs(title = "Relaciones entre variables y diagnóstico",
+         x = "Diagnóstico (0 = No COVID/Long COVID No Cog; 1 = Long COVID Cog)",
+         y = "Valores",
+         fill = "Diagnóstico") # Título de la leyenda)
+}
+```
+
+
+```{r}
+#-------------------------------------------------------------------------------
+# IMAGEN 6
+#-------------------------------------------------------------------------------
+pdf("outputs/images/06_relaciones.pdf", width = 16, height = 10)
+
+# b) Relaciones numéricas-categóricas
+# Ajustando "Target" como variable objetivo
+if ("Target" %in% colnames(df_def_clean)) {
+  df_def_clean %>%
+    mutate(Target = as.factor(Target)) %>% #Considerando que Target es binaria
+    gather(key = "Variable", value = "Value", -Target) %>%
+    filter(!is.na(Value)) %>%
+    ggplot(aes(x = Target, y = Value)) +
+    geom_boxplot() +
+    facet_wrap(~ Variable, scales = "free") +
+    theme_minimal() +
+    labs(title = "Relaciones entre variables y Target",
+         x = "Diagnóstico (0 = No COVID/Long COVID No Cog; 1 = Long COVID Cog)",
+         y = "Valores",
+         fill = "Diagnóstico") # Título de la leyenda
+}
+dev.off()
+```
+
+
+
+Reducción de la dimensionalidad
+
+```{r}
+#Realmente no vamos a realizar una eliminación de variables "autómatica" pero la función del paquete puede tener interés de cara a la aplicabilidad posterior. Guardamos los resultados en una nueva variable para no interferir en análisis posteriores
+
+# a) Eliminar variables con baja variabilidad: esto es "automático" con el paquete caret
+nzv <- nearZeroVar(df_def_clean, saveMetrics = TRUE)
+low_variability_vars <- rownames(nzv[nzv$nzv == TRUE, ])
+cat("Variables con baja variabilidad eliminadas:", low_variability_vars, "\n")
+df_def_clean_low_var <- df_def_clean %>% dplyr::select(-all_of(low_variability_vars))
+```
+
+
+
+```{r}
+# b) Análisis de componentes principales (PCA)
+
+pca_data_scaled <- scale(df_def_clean)
+pca <- prcomp(pca_data_scaled, center = TRUE)
+summary(pca)  #Verificar proporción de la varianza explicada
+```
+```{r}
+#Extraemos la proporción de la varianza explicada
+pca_var <- pca$sdev^2  # Varianza explicada por cada componente
+pca_var_exp <- pca_var / sum(pca_var)  # Proporción de varianza explicada
+
+#Creamos un dataframe para el plot (sin reordenar manualmente)
+scree_data <- data.frame(
+  PC = factor(paste0("PC", seq_along(pca_var_exp)), 
+              levels = paste0("PC", seq_along(pca_var_exp))),  #Forzar el orden
+  Variance_Explained = pca_var_exp
+)
+
+#Scree Plot
+library(ggplot2)
+ggplot(scree_data, aes(x = PC, y = Variance_Explained)) +
+  geom_bar(stat = "identity", fill = "skyblue", color = "black") +
+  geom_line(aes(group = 1), color = "red") + #Línea conectando las barras
+  geom_point(color = "red") + #Puntos en la línea
+  theme_minimal() +
+  labs(
+    title = "Scree Plot",
+    x = "Componentes principales",
+    y = "Proporción de varianza explicada"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+
+```{r}
+#-------------------------------------------------------------------------------
+# IMAGEN 7
+#-------------------------------------------------------------------------------
+pdf("outputs/images/07_screeplot.pdf", width = 16, height = 10)
+# Scree Plot
+library(ggplot2)
+ggplot(scree_data, aes(x = PC, y = Variance_Explained)) +
+  geom_bar(stat = "identity", fill = "skyblue", color = "black") +
+  geom_line(aes(group = 1), color = "red") + # Línea conectando las barras
+  geom_point(color = "red") + # Puntos en la línea
+  theme_minimal() +
+  labs(
+    title = "Scree Plot",
+    x = "Componentes principales",
+    y = "Proporción de varianza explicada"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  
+dev.off()
+```
+
+
+
+Necesitamos unas 13 componentes para explicar el 80% de la varianza. Las 2 primeras solo explican un 50% de la varianza.
+
+
+```{r}
+# Visualzación más sencilla
+fviz_pca_ind(pca, 
+             habillage = df_def_clean$Target,
+             label = "none", 
+             repel = TRUE, 
+             title = "Análisis de componentes principales (Diagnóstico como variable suplementaria)")
+```
+
+```{r}
+#-------------------------------------------------------------------------------
+# IMAGEN 8
+#-------------------------------------------------------------------------------
+pdf("outputs/images/08_PCA.pdf", width = 16, height = 10)
+# Visualzación más sencilla
+fviz_pca_ind(pca, 
+             habillage = df_def_clean$Target,
+             label = "none", 
+             repel = TRUE, 
+             title = "Análisis de componentes principales (Diagnóstico como variable de agrupación)")
+```
+
+
+```{r}
+# ----------------------
+# Clustering para patrones
+# ----------------------
+#Generamos matriz de distancias y dendrograma
+dist_matrix <- dist(scale(numeric_vars_def))
+hclust_model <- hclust(dist_matrix, method = "ward.D2")
+plot(hclust_model, main = "Dendrograma de clustering jerárquico")
+
+#Cortamos el dendrograma en 2 clústeres
+clusters <- cutree(hclust_model, k = 2)  # Cambiar "k" al número de clústeres sobre el que se cortará
+
+#Ver asignaciones de clústeres para las observaciones
+print(clusters)
+
+```
+
+Verificar como funciona el clúster.
+
+```{r}
+#Asociamos observaciones con cada clúster
+cluster_observations <- split(row.names(numeric_vars_def), clusters)
+
+#Ver observaciones de cada clúster
+print("Observaciones en el clúster 1:")
+print(cluster_observations[[1]])
+print("Observaciones en el clúster 2:")
+print(cluster_observations[[2]])
+
+#Filtramos datos por clústeres (trabajar con subconjuntos)
+cluster_1 <- numeric_vars_def[clusters == 1, ]
+cluster_2 <- numeric_vars_def[clusters == 2, ]
+
+#Ver los subconjuntos
+print("Datos del clúster 1:")
+print(cluster_1)
+print("Datos del clúster 2:")
+print(cluster_2)
+
+#Agregamos la asignación de clústeres como columna en los datos originales
+numeric_vars_def$cluster <- clusters
+
+#Visualizamos los datos con la columna de clúster
+print("Datos originales con asignación de clúster:")
+print(head(numeric_vars_def))
+
+#Resumen por clúster
+cluster_summary <- aggregate(. ~ cluster, data = numeric_vars_def, mean)
+print("Resumen por clúster:")
+print(cluster_summary)
+
+#Agregamos rectángulos al dendrograma para visualizar los clústeres
+plot(hclust_model, main = "Dendrograma con clústeres")
+rect.hclust(hclust_model, k = 2, border = "red")
+```
+La organización por clústeres no parece ser de utilidad inicial.
+
+## Estadística descriptiva e inferial básica.
+
+Vamos a seleccionar las variables que son factores (reales) y las vamos a contrastar con chi-cuadrado
+
+```{r}
+#Creamos un dataset nuevo para evitar trabajar sobre el original y aquí hacemos las pruebas.
+df_chi <- df_def_clean %>%
+  dplyr::select(where(~ is.numeric(.) && all(. %in% c(0, 1)))) %>%
+  mutate(Target = as.factor(df_def_clean$Target))  #Agregar Target como factor
+
+```
+
+
+```{r}
+# ------------------------------------------------------------------------------
+# FILTRADO POR FRECUENCIA Y PRUEBAS DE CHI-CUADRADO
+# ------------------------------------------------------------------------------
+
+# 1. Calcular las frecuencias mínimas para cada variable dummy
+low_freq_vars <- sapply(names(df_chi), function(var) {
+  freq_table <- table(df_chi[[var]])  # Calcular la tabla de frecuencias
+  min(freq_table)  # Obtener la frecuencia mínima para cada variable
+})
+
+# 2. Definir el umbral de frecuencia mínima
+threshold <- 5  # Se puede cambiar el umbral si es necesario
+
+# 3. Seleccionar variables con frecuencias mínimas mayores o iguales al umbral
+valid_vars <- names(low_freq_vars[low_freq_vars >= threshold])
+
+# 4. Filtrar el dataset para mantener solo las variables con frecuencias aceptables
+df_chi_filtered <- df_chi %>% 
+  dplyr::select(all_of(valid_vars))  # Seleccionar las variables válidas
+
+# 5. Realizar pruebas de chi-cuadrado para las variables filtradas contra Target
+chi_results_filtered <- sapply(names(df_chi_filtered), function(var) {
+  table_var <- table(df_chi_filtered[[var]], df_def$Target)  # Crear tabla de contingencia
+  chi_test <- chisq.test(table_var)  # Realizar prueba de chi-cuadrado
+  return(chi_test$p.value)  #Extraer el valor p
+})
+
+# 6. Convertir los resultados a un dataframe
+chi_results_filtered_df <- data.frame(
+  Variable = names(chi_results_filtered),  # Nombre de las variables
+  P_Value = chi_results_filtered  # Valores p
+)
+
+# 7. Ordenar los resultados por valor p
+chi_results_filtered_df <- chi_results_filtered_df %>% 
+  arrange(P_Value)
+
+# ------------------------------------------------------------------------------
+# RESULTADOS Y VISUALIZACIÓN
+# ------------------------------------------------------------------------------
+
+#Mostramos el resumen de los resultados
+print(chi_results_filtered_df)
+
+#Guardamos los resultados en un archivo CSV
+# write.csv(chi_results_filtered_df, "chi_squared_results_filtered.csv", row.names = FALSE)
+
+#Filtramos variables significativas (p < 0.05)
+significant_vars_chi <- chi_results_filtered_df %>% 
+  filter(P_Value < 0.05)
+
+#Mostramos las variables significativas
+print(significant_vars_chi)
+
+```
+
+Sobre Chi-cuadrado:
+
+Un p-valor bajo significa que la distribución de las categorías de la variable explicativa difiere significativamente entre las categorías de Target. Es decir, las frecuencias de las categorías no son independientes entre sí, lo que sugiere una relación entre la variable explicativa y Target.
+
+Por ejemplo, si spec1_Hospitalization tiene un p-valor bajo, esto implica que las frecuencias de hospitalización están distribuidas de manera diferente según la categoría de Target (No_LC vs. LC_Cog) (lo que podría ser relevante para el modelo).
+
+## Análisis de variables cuantitativas.
+
+Hay diferentes opciones y modelos, sin embargo, las opciones paramétricas no serán fácilmente aplicables porque los supuestos no se terminan de cumplir en las variables. En consecuencia, aunque completemos el modelado, su aplicación no es correcta. Uno de dichos modelos es la regresión logística.
+
+```{r}
+#Seleccionamos únicamente las variables numéricas continuas (excluyendo las dummy)
+numeric_vars_log <- df_def_clean %>%
+  dplyr::select(where(is.numeric)) %>%   #Seleccionar variables numéricas
+  dplyr::select_if(~ length(unique(.)) > 2)  #Excluir las dummies (solo deja aquellas con más de 2 valores únicos)
+
+numeric_vars_log$Target <- as.factor(df_def_clean$Target)
+
+```
+
+Siguiendo con el análisis inferencial sobre variables númericas, vamos a usar Kruskal-Wallis
+
+```{r}
+#Realizamos el test de Kruskal-Wallis para cada variable (sobre las variables continuas)
+kruskal_results <- sapply(colnames(numeric_vars_log)[-which(colnames(numeric_vars_log) == "Target")], function(var) {
+  kruskal.test(as.formula(paste(var, "~ Target")), data = numeric_vars_log)$p.value
+})
+
+#Pasamos resultados a dataframe
+kruskal_results_df <- data.frame(
+  Variable = names(kruskal_results),
+  P_Value = kruskal_results
+)
+
+#Ordenamos por valor p
+kruskal_results_df <- kruskal_results_df %>% arrange(P_Value)
+
+#Mostramos los resultados
+print(kruskal_results_df)
+
+#Filtramos variables significativas (p < 0.05)
+significant_vars_krus <- kruskal_results_df %>% 
+  filter(P_Value < 0.05)
+```
+
+
+## A partir de aquí ya podemos generar los modelos.
+
+El modelo con más restricciones es el logístico, pero lo podemos generar para tener un valor de comparación con otros modelos más complejos.
+
+MODELO LOGÍSTICO
+
+```{r}
+#Pasos:
+
+# 1. Dividir el dataset en entrenamiento y prueba
+set.seed(2435)
+train_idx <- sample(seq_len(nrow(numeric_vars_log)), size = 0.7 * nrow(numeric_vars_log))
+
+train_data_log <- numeric_vars_log[train_idx, ]
+test_data_log <- numeric_vars_log[-train_idx, ]
+
+# 2. Ajustar el modelo de regresión logística
+logistic_model <- glm(Target ~ ., data = train_data_log, family = binomial)
+
+#Summary
+summary(logistic_model)
+vif_values <- vif(logistic_model)  # Calcular VIF
+print(vif_values) #No hay valores VIF por encima de 5
+crPlots(logistic_model) #De forma global, las variables son aptas para un modelo logístico. Quizás tn6 puede dar problemas.
+
+# 3. Obtener predicciones en el conjunto de prueba
+predicted_probs <- predict(logistic_model, 
+                           newdata = test_data_log, 
+                           type = "response")
+predicted_class <- ifelse(predicted_probs > 0.5, 1, 0)
+
+# 4. Evaluar el modelo: Calcular la curva ROC y el AUC
+roc_curve_log <- roc(test_data_log$Target, predicted_probs)
+auc_value_log <- auc(roc_curve_log)
+
+# Mostrar la curva ROC
+plot(roc_curve_log,
+     main = "Curva ROC", 
+     col = "blue", 
+     lwd = 2, 
+     print.auc = TRUE)
+
+cat("El valor del AUC es:", auc_value_log, "\n")
+
+# 5. Evaluar el modelo: matriz de confusión y métricas
+conf_matrix_log <- confusionMatrix(as.factor(predicted_class), 
+                                   as.factor(test_data_log$Target),
+                                   mode="everything",
+                                   positive = "1")
+
+# Mostrar resultados clave
+print(conf_matrix_log)
+```
+
+```{r}
+#-------------------------------------------------------------------------------
+# IMAGEN 9
+#-------------------------------------------------------------------------------
+pdf("outputs/images/09_roc_log.pdf", width = 16, height = 10)
+# Mostrar la curva ROC
+plot(roc_curve_log,
+     main = "Curva ROC (Modelo logístico)", 
+     col = "blue", 
+     lwd = 2, 
+     print.auc = TRUE)
+dev.off()
+```
+
+
+Otra opción sería un análisis de discriminante lineal, pero no se cumplen los postulados requeridos, así que debe desecharse (se deja el código para constancia por si en algún momento se reescribe o ingresan nuevas variables de interés)
+
+```{r}
+#Dividimos en train y test
+set.seed(1234)
+train_idx_lda <- sample(seq_len(nrow(numeric_vars_log)), size = 0.7 * nrow(numeric_vars_log))
+train_data_lda <- numeric_vars_log[train_idx_lda, ]
+test_data_lda <- numeric_vars_log[-train_idx_lda, ]
+
+# Comprobación de supuestos:
+
+#Seleccionamos únicamente las columnas numéricas (excluyendo Target ya que no es numérica)
+predictors <- train_data_lda[, sapply(train_data_lda, is.numeric)]
+
+#Se realiza la prueba de Shapiro-Wilk por grupo (según Target)
+normality_results <- by(predictors, train_data_lda$Target, function(group_data) {
+  apply(group_data, 2, function(column) shapiro.test(column)$p.value)
+})
+
+print(normality_results)
+
+# Interpretación:
+# - Si los p-valores son mayores a 0.05, no se rechaza la hipótesis de normalidad. HAY VARIAS VARIABLES QUE NO SIGUEN LA NORMALIDAD
+
+# b) Homogeneidad de varianzas con test de Levene
+levene_results <- sapply(colnames(predictors), function(var) {
+  leveneTest(as.formula(paste(var, "~ Target")), data = train_data_lda)$"Pr(>F)"[1]
+})
+print(levene_results)
+
+# Interpretación:
+# - Si los p-valores son mayores a 0.05, no se rechaza la hipótesis de igualdad de varianzas.
+
+# c) Multicolinealidad (VIF)
+vif_values_lda <- vif(lm(Target ~ ., data = train_data_lda))
+print(vif_values_lda)
+
+# Interpretación:
+# - VIF < 5: No hay problemas significativos de multicolinealidad.
+# - VIF > 5: Multicolinealidad moderada.
+# - VIF > 10: Multicolinealidad alta.
+
+#Ajustamos modelo LDA
+lda_model <- lda(Target ~ ., data = train_data_lda)
+print(lda_model)
+
+#Visualizamos el modelo LDA
+plot(lda_model)
+
+#Realizamos las predicciones
+lda_pred <- predict(lda_model, newdata = test_data_lda)
+predicted_class <- lda_pred$class
+posterior_probs <- lda_pred$posterior
+
+#Matriz de confusión
+conf_matrix <- confusionMatrix(as.factor(predicted_class), as.factor(test_data_lda$Target))
+print(conf_matrix)
+
+#Curva ROC y AUC (lda)
+roc_curve_lda <- roc(test_data_lda$Target, posterior_probs[, 2])  # Probabilidad de la clase 1
+plot(roc_curve_lda, 
+     main = "Curva ROC - LDA", 
+     col = "blue", 
+     lwd = 2, 
+     print.auc=TRUE)
+
+auc_value_lda <- auc(roc_curve_lda)
+cat("\nEl valor del AUC es:", auc_value_lda, "\n")
+
+```
+
+XGBOOST 
+
+Un modelo más complejo pero más generalizable y escalable con mayor precisión para uso clínico real.
+
+```{r}
+# Dividir el dataset en entrenamiento y test
+set.seed(2429)
+#semillas interesantes: (0.8) 1234, 1237, 1238, 1339
+#semillas interesantes: (0.7) 1339, 1441 por el recall
+#semillas interesantes (0.75) 1234
+#Tras mejoras (que es evitar el rol del desbalance y que la clase positiva sea 1), es decir,
+#identificar los casos de long covid y 0.75: 1236, 1237, #1239
+# tras mejoras y 0,8: 2435, 2429, 2433, 2435
+
+trainIndex <- createDataPartition(df_def_clean$Target, p = 0.8, list = FALSE)
+train_data <- df_def_clean[trainIndex, ]
+test_data <- df_def_clean[-trainIndex, ]
+
+#Definimos la columna objetivo para entrenamiento y prueba 
+train_target <- train_data$Target
+test_target <- test_data$Target
+
+#Eliminamos la columna objetivo de los datos de entrenamiento y prueba
+train_data <- train_data %>% dplyr::select(-Target)
+test_data <- test_data %>% dplyr::select(-Target)
+
+#Convertimos los datasets a matrices para XGBoost
+train_matrix <- as.matrix(train_data)
+test_matrix <- as.matrix(test_data)
+
+#Creamos DMatrix para XGBoost
+dtrain <- xgb.DMatrix(data = train_matrix, label = train_target)
+dtest <- xgb.DMatrix(data = test_matrix, label = test_target)
+
+#Calculamos el peso para la clase positiva (en este dataset hay desbalance)
+num_negativos <- sum(train_target == 0)  # Casos de la clase 0
+num_positivos <- sum(train_target == 1)  # Casos de la clase 1
+scale_pos_weight <- num_negativos / num_positivos
+
+#Generamos la lista de parámetros que usaremos
+params <- list(
+  objective = "binary:logistic",  
+  eval_metric = "logloss",         
+    scale_pos_weight = scale_pos_weight  #Peso para manejar el desbalance de clases
+)
+
+#Entrenamos el modelo de clasificación binaria con XGBoost
+modelo_xgb <- xgboost(data = dtrain, 
+                      params = params,
+                      verbose = 0,
+                      nrounds = 500)
+
+#Generamos predicciones en el conjunto de prueba
+predicciones <- predict(modelo_xgb, test_matrix)
+
+#Convertimos las probabilidades en clases
+predicciones_clase <- ifelse(predicciones >= 0.5, 1, 0)
+
+#Matriz de confusión
+matriz_confusion <- table(Predicho = predicciones_clase, Real = test_target)
+print(matriz_confusion)
+
+#Matriz de confusión con caret para métricas adicionales
+confusion <- confusionMatrix(factor(predicciones_clase), 
+                             factor(test_target), 
+                             mode="everything",
+                             positive = "1")
+
+print(confusion)
+
+```
+
+
+
+```{r}
+#predicciones <- predict(modelo_xgb, test_matrix)
+
+#Creamos curva ROC
+roc_xgboost <- roc(test_target, predicciones)
+
+#Curva ROC
+plot(roc_xgboost, 
+     col = "blue", 
+     main = "Curva ROC (Modelo XGBoost)", 
+     print.auc = TRUE)
+
+#Calculamos AUC
+auc_valor_xgboost <- auc(roc_xgboost)
+print(paste("El AUC es:", auc_valor_xgboost))
+
+```
+```{r}
+#-------------------------------------------------------------------------------
+# IMAGEN 10
+#-------------------------------------------------------------------------------
+pdf("outputs/images/10_roc_xg.pdf", width = 16, height = 10)
+#Curva ROC
+plot(roc_xgboost, 
+     col = "blue", 
+     main = "Curva ROC (Modelo XGBoost)", 
+     print.auc = TRUE)
+dev.off()
+```
+
+```{r}
+# Graficar la primera curva ROC
+plot(roc_xgboost, 
+     col = "blue", 
+     main = "Comparación de curvas ROC")
+
+# Agregar las demás curvas
+lines(roc_curve_log, col = "red")
+#lines(roc_curve_lda, col = "green")
+
+# Añadir una leyenda
+# legend("bottomright",
+#        legend = c("Modelo XGBoost", "Modelo logístico", "Modelo LDA"),
+#        col = c("blue", "red", "green"),
+#        lwd = 2)
+
+# Añadir una leyenda
+legend("bottomright",
+       legend = c("Modelo XGBoost", "Modelo logístico"),
+       col = c("blue", "red"),
+       lwd = 2)
+
+```
+
+
+
+```{r}
+#-------------------------------------------------------------------------------
+# IMAGEN OPCIONAL
+#-------------------------------------------------------------------------------
+pdf("outputs/images/00_COMPARACION_ROCS.pdf", width = 16, height = 10)
+# Graficar la primera curva ROC
+plot(roc_xgboost, 
+     col = "blue", 
+     main = "Comparación de curvas ROC")
+
+# Agregar la/s otra/s curva/s
+lines(roc_curve_log, col = "red")
+
+# Añadir una leyenda
+legend("bottomright",
+       legend = c("Modelo XGBoost", "Modelo logístico"),
+       col = c("blue", "red"),
+       lwd = 2)
+dev.off()
+```
+
+
+```{r}
+#Obtenemos la importancia de las variables
+importancia <- xgb.importance(model = modelo_xgb, feature_names = colnames(train_matrix))
+
+#Convertimos la importancia en un dataframe
+importancia_df <- as.data.frame(importancia)
+
+# Ordenamos las variables por importancia de mayor a menor
+importancia_df <- importancia_df[order(-importancia_df$Gain), ]
+
+#Mostramos la importancia de las variables
+print(importancia)
+
+#Graficamos la importancia de las variables
+xgb.plot.importance(importance_matrix = importancia)
+```
+
+
+```{r}
+#-------------------------------------------------------------------------------
+# IMAGEN 11
+#-------------------------------------------------------------------------------
+pdf("outputs/images/11_importancia.pdf", width = 16, height = 10)
+#Graficamos la importancia de las variables
+xgb.plot.importance(importance_matrix = importancia)
+dev.off()
+```
+
+Para darle mayor explicabilidad al modelo vamos a calcular los valores SHAP de observaciones individuales
+
+```{r}
+#Definimos la función de predicción personalizada para el modelo xgboost
+pred_fun <- function(object, newdata) {
+  predict(object, newdata = xgb.DMatrix(data = as.matrix(newdata)))
+}
+
+#Convertimos test_data a dataframe y seleccionamos una observación para explicar
+test_df <- as.data.frame(as.matrix(test_data))
+new_observation <- test_df[2, , drop = FALSE]  # Seleccionar la observación número 2
+
+#Calculamos los valores SHAP para la observación seleccionada
+set.seed(2435)
+shap_values_fast <- fastshap::explain(
+  object = modelo_xgb,             # El modelo de xgboost
+  feature_names = colnames(train_data), # Los nombres de las variables
+  newdata = new_observation,       # La observación para la cual queremos valores SHAP
+  pred_wrapper = pred_fun,         # La función de predicción personalizada
+  X = train_data,                    # El conjunto de entrenamiento completo
+  nsim = 100                       # Número de simulaciones
+)
+
+#Convertimos los valores SHAP a un dataframe para graficar
+shap_df <- data.frame(
+  Variable = colnames(new_observation),
+  SHAP = shap_values_fast[1, ]  # Solo la primera fila (si tienes más observaciones)
+)
+
+#Graficamos los valores SHAP
+ggplot(shap_df, aes(x = reorder(Variable, SHAP), y = SHAP)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Valores SHAP para la bbservación seleccionada",
+       x = "Variable",
+       y = "Valor SHAP") +
+  theme_minimal()
+
+```
+
+```{r}
+#-------------------------------------------------------------------------------
+# IMAGEN 12
+#-------------------------------------------------------------------------------
+pdf("outputs/images/12_ejemplo_SHAP.pdf", width = 16, height = 10)
+#Graficamos los valores SHAP
+ggplot(shap_df, aes(x = reorder(Variable, SHAP), y = SHAP)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Valores SHAP para la bbservación seleccionada",
+       x = "Variable",
+       y = "Valor SHAP") +
+  theme_minimal()
+dev.off()
+```
+
+
+
+```{r}
+########### VARIOS VALORES ###############################
+
+#Convertimos test_data a dataframe y seleccionamos múltiples observaciones para explicar. Usaremos todo el conjunto de test.
+test_df <- as.data.frame(as.matrix(test_data))
+new_observations <- test_df[1:48, , drop = FALSE]  #Seleccionamos todo el conjunto de dataset
+
+#Calculamos los valores SHAP para las observaciones seleccionadas
+set.seed(2435)
+shap_values_fast_24 <- fastshap::explain(
+  object = modelo_xgb,               # El modelo de xgboost
+  feature_names = colnames(train_data), # Los nombres de las variables
+  newdata = new_observations,         # Las observaciones seleccionadas
+  pred_wrapper = pred_fun,            # La función de predicción personalizada
+  X = train_data,                       # El conjunto de entrenamiento completo
+  nsim = 100                          # Número de simulaciones
+)
+
+#Convertimos shap_values_fast a dataframe y añadimos un identificador de observación en el proceso de pivotaje
+shap_df_24 <- as.data.frame(shap_values_fast_24)
+colnames(shap_df_24) <- colnames(train_data)
+shap_df_24$Observation <- factor(1:48)
+
+#Convertimos a formato largo para visualización
+shap_df_long <- shap_df_24 %>%
+  pivot_longer(cols = -Observation, names_to = "Variable", values_to = "SHAP")
+
+#Graficar los valores SHAP para múltiples observaciones
+ggplot(shap_df_long, aes(x = reorder(Variable, SHAP), y = SHAP, fill = Observation)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  labs(title = "Comparación de Valores SHAP para grupo de prueba",
+       x = "Variable",
+       y = "Valor SHAP") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+```
+
+
+
+```{r}
+############### COMPARAR TODOS LOS VALORES SHAP ################################
+
+#Calculamos la importancia promedio absoluta de cada variable: la idea es tener un peso "absoluto" (en un sentido u otro) de cara a cada predicción realizada
+importance_summary <- shap_df_24 %>%
+  dplyr::select(-Observation) %>%  # Excluimos la columna de observación
+  summarise_all(~ mean(abs(.))) %>%  # Calculamos la media absoluta para cada variable
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Mean_Absolute_SHAP") %>%
+  arrange(desc(Mean_Absolute_SHAP))  # Ordenamos de mayor a menor importancia
+
+# Graficar la importancia promedio de cada variable
+ggplot(importance_summary, aes(x = reorder(Variable, Mean_Absolute_SHAP), y = Mean_Absolute_SHAP)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Importancia promedio de cada variable en las predicciones",
+       x = "Variable",
+       y = "Valor SHAP medio absoluto - Mean Absolute SHAP Value") +
+  theme_minimal()
+
+#Mostramos el dataframe con la importancia promedio de cada variable
+print(importance_summary)
+```
+
+
+```{r}
+#-------------------------------------------------------------------------------
+# IMAGEN 13
+#-------------------------------------------------------------------------------
+pdf("outputs/images/13_valores_SHAP_absolutos.pdf", width = 16, height = 10)
+# Graficar la importancia promedio de cada variable
+ggplot(importance_summary, aes(x = reorder(Variable, Mean_Absolute_SHAP), y = Mean_Absolute_SHAP)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Importancia promedio de cada variable en las predicciones",
+       x = "Variable",
+       y = "Valor SHAP medio absoluto - Mean Absolute SHAP Value") +
+  theme_minimal()
+dev.off()
+```
+
+
