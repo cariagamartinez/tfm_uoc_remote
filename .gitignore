@@ -1,6 +1,10 @@
 BBDD/
 WIP/
 data/
+@MDS/
+TFM_Cariaga_cache/
+TFM_Cariaga_files/
+
 .Rhistory
 .DS_Store
 .Rproj.user

@@ -21,6 +21,7 @@ knitr::opts_chunk$set(echo = TRUE,
 
 ```{r}
 # Librerías
+library(sessioninfo)
 library(knitr)
 library(kableExtra)
 library(fastDummies)
@@ -40,14 +41,6 @@ library(multcomp)
 library(pROC)
 library(fastshap)
 
-#Otras posibles
-#library(readxl)
-#library(psych)
-#library(DataExplorer)
-#library(GGally)
-#library(ROSE)
-#library(ggfortify)
-
 ```
 
 ```{r, echo=FALSE, results='hide', comment=''}
@@ -59,6 +52,21 @@ library(fastshap)
 #POR MOTIVOS DE SEGURIDAD, NO ESTÁ COMPARTIDA: data/bbddAECM_07_10_24.csv
 
 bbddAECM <- read_csv("data/bbddAECM_07_10_24.csv")
+
+#Algunas características de la base de datos original
+summary(bbddAECM)
+
+char_cols <- bbddAECM %>%
+  dplyr::select(where(is.character))
+
+#Creamos tabla de frecuencias en formato largo
+freq_table <- char_cols %>%
+  pivot_longer(everything(), names_to = "column", values_to = "value") %>%
+  group_by(column) %>%  # Agrupar por columna
+  count(value, name = "Frecuencia") %>%
+  mutate(Porcentaje = round(Frecuencia / sum(Frecuencia) * 100, 2)) %>%  # Porcentaje por columna
+  ungroup()
+
 ```
 ## OBTENCIÓN DEL DATASET FINAL
 
@@ -680,12 +688,12 @@ df_chi_filtered <- df_chi %>%
 
 # 5. Realizar pruebas de chi-cuadrado para las variables filtradas contra Target
 chi_results_filtered <- sapply(names(df_chi_filtered), function(var) {
-  table_var <- table(df_chi_filtered[[var]], df_def$Target)  # Crear tabla de contingencia
+  table_var <- table(df_chi_filtered[[var]], df_def_clean$Target)  # Crear tabla de contingencia
   chi_test <- chisq.test(table_var)  # Realizar prueba de chi-cuadrado
   return(chi_test$p.value)  #Extraer el valor p
 })
 
-# 6. Convertir los resultados a un dataframe
+# 6. Convertir los resultados a dataframe
 chi_results_filtered_df <- data.frame(
   Variable = names(chi_results_filtered),  # Nombre de las variables
   P_Value = chi_results_filtered  # Valores p
@@ -718,7 +726,7 @@ Sobre Chi-cuadrado:
 
 Un p-valor bajo significa que la distribución de las categorías de la variable explicativa difiere significativamente entre las categorías de Target. Es decir, las frecuencias de las categorías no son independientes entre sí, lo que sugiere una relación entre la variable explicativa y Target.
 
-Por ejemplo, si spec1_Hospitalization tiene un p-valor bajo, esto implica que las frecuencias de hospitalización están distribuidas de manera diferente según la categoría de Target (No_LC vs. LC_Cog) (lo que podría ser relevante para el modelo).
+Por ejemplo, si spec1_Hospitalization tiene un p-valor bajo, esto implica que las frecuencias de hospitalización están distribuidas de manera diferente según la categoría de Target (No_LC vs. LC_Cog) (lo que podría ser relevante para el modelo). En este caso también habría que tener en cuenta cómo podría afectar el desbalance de las clases que se observa en el EDA.
 
 ## Análisis de variables cuantitativas.
 
@@ -734,29 +742,34 @@ numeric_vars_log$Target <- as.factor(df_def_clean$Target)
 
 ```
 
-Siguiendo con el análisis inferencial sobre variables númericas, vamos a usar Kruskal-Wallis
+Siguiendo con el análisis inferencial sobre variables númericas, vamos a usar una comparación no paramétrica, media a media.
 
 ```{r}
-#Realizamos el test de Kruskal-Wallis para cada variable (sobre las variables continuas)
-kruskal_results <- sapply(colnames(numeric_vars_log)[-which(colnames(numeric_vars_log) == "Target")], function(var) {
-  kruskal.test(as.formula(paste(var, "~ Target")), data = numeric_vars_log)$p.value
+# Realizamos la prueba de Mann-Whitney U (Wilcoxon rank-sum test) para cada variable continua
+mann_results <- sapply(colnames(numeric_vars_log)[-which(colnames(numeric_vars_log) == "Target")], function(var) {
+  wilcox.test(as.formula(paste(var, "~ Target")), data = numeric_vars_log)$p.value
 })
 
-#Pasamos resultados a dataframe
-kruskal_results_df <- data.frame(
-  Variable = names(kruskal_results),
-  P_Value = kruskal_results
+# Pasamos los resultados a un dataframe
+mann_results_df <- data.frame(
+  Variable = names(mann_results),
+  P_Value = mann_results
 )
 
-#Ordenamos por valor p
-kruskal_results_df <- kruskal_results_df %>% arrange(P_Value)
+# Ordenamos por valor p
+mann_results_df <- mann_results_df %>% arrange(P_Value)
 
-#Mostramos los resultados
-print(kruskal_results_df)
+# Mostramos los resultados
+print(mann_results_df)
 
-#Filtramos variables significativas (p < 0.05)
-significant_vars_krus <- kruskal_results_df %>% 
+# Filtramos variables significativas (p < 0.05)
+significant_vars_mann <- mann_results_df %>% 
   filter(P_Value < 0.05)
+
+# Mostramos las variables significativas
+print(significant_vars_mann)
+
+
 ```
 
 
@@ -770,8 +783,8 @@ MODELO LOGÍSTICO
 #Pasos:
 
 # 1. Dividir el dataset en entrenamiento y prueba
-set.seed(2435)
-train_idx <- sample(seq_len(nrow(numeric_vars_log)), size = 0.7 * nrow(numeric_vars_log))
+set.seed(123) #2435
+train_idx <- sample(seq_len(nrow(numeric_vars_log)), size = 0.8 * nrow(numeric_vars_log))
 
 train_data_log <- numeric_vars_log[train_idx, ]
 test_data_log <- numeric_vars_log[-train_idx, ]
@@ -939,18 +952,111 @@ num_negativos <- sum(train_target == 0)  # Casos de la clase 0
 num_positivos <- sum(train_target == 1)  # Casos de la clase 1
 scale_pos_weight <- num_negativos / num_positivos
 
-#Generamos la lista de parámetros que usaremos
+#Generamos la lista de parámetros generales que usaremos para una primera validación (cross-validation)
 params <- list(
   objective = "binary:logistic",  
   eval_metric = "logloss",         
     scale_pos_weight = scale_pos_weight  #Peso para manejar el desbalance de clases
 )
 
+```
+
+VALIDACIÓN CRUZADA
+
+```{r}
+# Configuración de la validación cruzada con funciones del paquete xgboost
+# set.seed(2429)  # Para reproducibilidad
+# cv_results <- xgb.cv(
+#   params = params,          # Parámetros del modelo
+#   data = dtrain,            # DMatrix con los datos de entrenamiento
+#   nrounds = 500,            # Número de iteraciones
+#   nfold = 10,                # Número de pliegues para validación cruzada
+#   metrics = "logloss",      # Métrica de evaluación
+#   verbose = TRUE,           # Mostrar progreso
+#   stratified = TRUE,        # Mantener proporción de clases en los pliegues
+#   early_stopping_rounds = 10 # Detener si no mejora en 10 rondas
+# )
+# 
+# # Mejor número de rondas
+# best_nrounds <- cv_results$best_iteration
+# print(paste("Mejor número de rondas:", best_nrounds))
+# 
+# # Resumen de métricas en los pliegues
+# print(cv_results$evaluation_log)
+```
+
+VALIDACIÓN CON CARET
+
+```{r}
+
+# Volver a agregar la columna objetivo a los datos de entrenamiento
+train_data_caret <- train_data %>%
+  mutate(Target = as.factor(ifelse(train_target == 1, "Yes", "No")))
+
+# Asegúrate de que el conjunto de prueba también tenga Target para evaluación posterior
+test_data_caret <- test_data %>%
+  mutate(Target = as.factor(ifelse(test_target == 1, "Yes", "No")))
+
+# Configurar control de validación cruzada
+train_control <- trainControl(
+  method = "cv",    # Validación cruzada
+  number = 10,       # Número de pliegues
+  verboseIter = TRUE,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+)
+
+# Definir los hiperparámetros que queremos probar
+tune_grid <- expand.grid(
+  nrounds = c(100, 200, 300),  # Número de iteraciones
+  max_depth = c(3, 6, 9),      # Profundidad máxima
+  eta = c(0.01, 0.1),          # Tasa de aprendizaje
+  gamma = 0,                   # Complejidad mínima
+  colsample_bytree = 0.8,
+  min_child_weight = 1,
+  subsample = 0.8
+)
+
+# Ejecutar la validación cruzada
+xgb_model_caret <- train(
+  Target ~ .,
+  data = train_data_caret,
+  method = "xgbTree",
+  trControl = train_control,
+  tuneGrid = tune_grid,
+  metric = "ROC" # Optimizar el área bajo la curva ROC
+)
+
+# Ver el mejor conjunto de hiperparámetros
+print(xgb_model_caret$bestTune)
+```
+
+
+ENTRENAMIENTO DEL MODELO FINAL
+
+```{r}
+# Tras realizar la validación cruzada ampliamos los parámetros
+set.seed(1239)
+
+#buenas seeds: 2435, 1239
+
+params_cv <- list(
+  objective = "binary:logistic",  
+  eval_metric = "logloss",         
+  scale_pos_weight = scale_pos_weight,  # Peso para manejar el desbalance
+  max_depth = 6,                        # Mejor valor de max_depth
+  eta = 0.01,                           # Mejor valor de eta
+  gamma = 0,                            # Mejor valor de gamma
+  colsample_bytree = 0.8,               # Mejor valor de colsample_bytree
+  min_child_weight = 1,                 # Mejor valor de min_child_weight
+  subsample = 0.8                       # Mejor valor de subsample
+)
+
 #Entrenamos el modelo de clasificación binaria con XGBoost
 modelo_xgb <- xgboost(data = dtrain, 
-                      params = params,
+                      params = params_cv,
                       verbose = 0,
-                      nrounds = 500)
+                      nrounds = 100)
 
 #Generamos predicciones en el conjunto de prueba
 predicciones <- predict(modelo_xgb, test_matrix)
@@ -1069,12 +1175,11 @@ print(importancia)
 xgb.plot.importance(importance_matrix = importancia)
 ```
 
-
 ```{r}
 #-------------------------------------------------------------------------------
 # IMAGEN 11
 #-------------------------------------------------------------------------------
-pdf("outputs/images/11_importancia.pdf", width = 16, height = 10)
+pdf("outputs/images/11_importancia.pdf", width = 10, height = 10)
 #Graficamos la importancia de las variables
 xgb.plot.importance(importance_matrix = importancia)
 dev.off()
@@ -1113,7 +1218,7 @@ shap_df <- data.frame(
 ggplot(shap_df, aes(x = reorder(Variable, SHAP), y = SHAP)) +
   geom_bar(stat = "identity") +
   coord_flip() +
-  labs(title = "Valores SHAP para la bbservación seleccionada",
+  labs(title = "Valores SHAP para la observación seleccionada",
        x = "Variable",
        y = "Valor SHAP") +
   theme_minimal()
@@ -1129,7 +1234,7 @@ pdf("outputs/images/12_ejemplo_SHAP.pdf", width = 16, height = 10)
 ggplot(shap_df, aes(x = reorder(Variable, SHAP), y = SHAP)) +
   geom_bar(stat = "identity") +
   coord_flip() +
-  labs(title = "Valores SHAP para la bbservación seleccionada",
+  labs(title = "Valores SHAP para la observación seleccionada",
        x = "Variable",
        y = "Valor SHAP") +
   theme_minimal()
